@@ -1196,18 +1196,21 @@ impl Realtime {
                     self.label(id!(status_label))
                         .set_text(cx, &format!("❌ Error: {}", error));
 
-                    // Handle disconnection errors
+                    // Handle disconnection errors with safe reconnection scheduling
                     if error.contains("Disconnected") || error.contains("Connection error") {
+                        let was_active = self.conversation_active;
                         self.is_connected = false;
                         self.conversation_active = false;
-                        
-                        // Optionally trigger reconnection
-                        if self.conversation_active {
+
+                        // If we were in an active conversation, request reconnection
+                        if was_active {
                             self.should_request_connection = true;
+                            self.connection_request_sent = false;
+                            self.label(id!(status_label)).set_text(cx, "Reconnecting...");
                         }
                     }
 
-                    // Resume recording on error
+                    // Resume recording on recoverable errors during an active conversation
                     if self.conversation_active {
                         *self.should_record.lock().unwrap() = true;
                     }
