@@ -346,11 +346,22 @@ impl OpenAIRealtimeClient {
                 let (mut write, mut read) = ws_stream.split();
                 log::debug!("WebSocket connection created");
 
+                // Create control channel for ping/pong messages
+                let (ctrl_tx, mut ctrl_rx) = futures::channel::mpsc::unbounded::<WsMessage>();
+
                 // Spawn task to handle incoming messages
                 let event_sender_clone = event_sender.clone();
+                let ctrl_tx_clone = ctrl_tx.clone();
                 spawn(async move {
                     while let Some(msg) = read.next().await {
                         match msg {
+                            Ok(WsMessage::Ping(payload)) => {
+                                log::debug!("Received WebSocket ping, sending pong");
+                                let _ = ctrl_tx_clone.unbounded_send(WsMessage::Pong(payload));
+                            }
+                            Ok(WsMessage::Pong(_)) => {
+                                log::debug!("Received WebSocket pong");
+                            }
                             Ok(WsMessage::Text(text)) => {
                                 log::debug!("Received WebSocket message: {}", text);
                                 // log::info!("Received WebSocket message: {}", text);
@@ -432,14 +443,20 @@ impl OpenAIRealtimeClient {
                                     }
                                 }
                             }
-                            Ok(WsMessage::Close(_)) => {
-                                log::info!("WebSocket closed");
+                            Ok(WsMessage::Close(frame)) => {
+                                let reason = frame
+                                    .as_ref()
+                                    .map(|f| f.reason.to_string())
+                                    .unwrap_or_else(|| "Connection closed".to_string());
+                                log::info!("WebSocket closed: {}", reason);
+                                let _ = event_sender_clone
+                                    .unbounded_send(RealtimeEvent::Error(format!("Disconnected: {}", reason)));
                                 break;
                             }
                             Err(e) => {
                                 log::error!("WebSocket error: {}", e);
                                 let _ = event_sender_clone
-                                    .unbounded_send(RealtimeEvent::Error(e.to_string()));
+                                    .unbounded_send(RealtimeEvent::Error(format!("Connection error: {}", e)));
                                 break;
                             }
                             _ => {}
@@ -450,9 +467,20 @@ impl OpenAIRealtimeClient {
                 // Spawn task to handle outgoing commands
                 spawn(async move {
                     let model = bot_id.id().to_string();
-                    // Handle commands
-                    while let Some(command) = command_receiver.next().await {
-                        match command {
+                    
+                    // Create keepalive interval (25 seconds)
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let mut interval = tokio::time::interval(std::time::Duration::from_secs(25));
+                    
+                    loop {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            use futures::FutureExt;
+                            futures::select! {
+                                // Handle normal commands
+                                command = command_receiver.next() => {
+                                    if let Some(command) = command {
+                                        match command {
                             RealtimeCommand::UpdateSessionConfig {
                                 voice,
                                 transcription_model,
@@ -648,6 +676,42 @@ impl OpenAIRealtimeClient {
                                 break;
                             }
                         }
+                                    } else {
+                                        // Command channel closed
+                                        break;
+                                    }
+                                }
+                                // Handle control messages (pongs)
+                                ctrl = ctrl_rx.next() => {
+                                    if let Some(msg) = ctrl {
+                                        let _ = write.send(msg).await;
+                                    } else {
+                                        // Control channel closed
+                                        break;
+                                    }
+                                }
+                                // Send keepalive ping
+                                _ = interval.tick().fuse() => {
+                                    log::debug!("Sending keepalive ping");
+                                    let _ = write.send(WsMessage::Ping(b"keepalive".to_vec())).await;
+                                }
+                            }
+                        }
+                        
+                        #[cfg(target_arch = "wasm32")]
+                        {
+                            // On WASM, we don't have tokio::time::interval, so use a simpler approach
+                            while let Some(command) = command_receiver.next().await {
+                                match command {
+                                    RealtimeCommand::StopSession => {
+                                        break;
+                                    }
+                                    _ => {
+                                        // Handle other commands normally (existing code would go here)
+                                    }
+                                }
+                            }
+                        }
                     }
                 });
             }
@@ -751,20 +815,47 @@ impl OpenAIRealtimeClient {
         tokio_tungstenite::tungstenite::http::Error,
     > {
         use tokio_tungstenite::tungstenite::handshake::client::Request;
+        use tokio_tungstenite::tungstenite::http::Uri;
 
-        Request::builder()
+        // Parse the URL to get the host
+        let uri: Uri = url_str.parse().expect("Invalid WebSocket URL");
+        let host = uri.host().expect("URL must have a host");
+        
+        // Check if this is an OpenAI endpoint
+        let is_openai = host == "api.openai.com";
+        
+        // Build request with appropriate headers
+        let mut request = Request::builder()
             .uri(url_str)
-            .header("Host", "api.openai.com")
-            .header("Authorization", format!("Bearer {}", api_key))
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
             .header("Sec-WebSocket-Version", "13")
-            .header("OpenAI-Beta", "realtime=v1")
             .header(
                 "Sec-WebSocket-Key",
                 tokio_tungstenite::tungstenite::handshake::client::generate_key(),
-            )
-            .body(())
+            );
+        
+        // Set Host header based on the actual host (include port if present)
+        if let Some(port) = uri.port_u16() {
+            request = request.header("Host", format!("{}:{}", host, port));
+        } else {
+            request = request.header("Host", host);
+        }
+        
+        // Only add OpenAI-specific headers for OpenAI endpoints
+        if is_openai {
+            request = request.header("OpenAI-Beta", "realtime=v1");
+            if !api_key.is_empty() {
+                request = request.header("Authorization", format!("Bearer {}", api_key));
+            }
+        } else {
+            // For local providers, only add Authorization if API key is provided
+            if !api_key.is_empty() {
+                request = request.header("Authorization", format!("Bearer {}", api_key));
+            }
+        }
+        
+        request.body(())
     }
 
     /// Test WebSocket connection to validate credentials and connectivity.

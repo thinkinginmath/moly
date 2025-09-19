@@ -1196,6 +1196,17 @@ impl Realtime {
                     self.label(id!(status_label))
                         .set_text(cx, &format!("❌ Error: {}", error));
 
+                    // Handle disconnection errors
+                    if error.contains("Disconnected") || error.contains("Connection error") {
+                        self.is_connected = false;
+                        self.conversation_active = false;
+                        
+                        // Optionally trigger reconnection
+                        if self.conversation_active {
+                            self.should_request_connection = true;
+                        }
+                    }
+
                     // Resume recording on error
                     if self.conversation_active {
                         *self.should_record.lock().unwrap() = true;
